@@ -1,0 +1,14 @@
+services:
+  mock_api:
+    build: ./mock_api
+    ports:
+      - "5000:5000"
+
+  # Add your own service here once you've built your solution, e.g.:
+  #
+  # runner:
+  #   build: .
+  #   depends_on:
+  #     - mock_api
+  #   environment:
+  #     - MOCK_API_URL=http://mock_api:5000
