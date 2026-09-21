@@ -1,0 +1,19 @@
+# Normalize line endings in the repository.
+#
+# This project is authored on Windows and executed inside a Linux container,
+# so the working tree must stay LF-only. Without this, Git's autocrlf would
+# rewrite the checked-out files to CRLF and every diff would show whole-file
+# changes for what are logically one-line edits.
+
+* text=auto eol=lf
+
+# Binary assets must never be line-ending normalized.
+*.mp4 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.onnx binary
+
+# Lock files are generated; keep them out of diffs and language stats.
+*.lock -diff linguist-generated
