@@ -59,7 +59,14 @@ class RejectionReason(StrEnum):
 
 
 class RunStatus(StrEnum):
-    """How a run finished."""
+    """State of a run.
+
+    ``RUNNING`` appears only in progress reports, so that an in-flight run does not have
+    to claim a terminal state it has not reached. A finished run reports one of the
+    others.
+    """
+
+    RUNNING = "running"
 
     SUCCEEDED = "succeeded"
     NO_VALID_DETECTIONS = "no_valid_detections"

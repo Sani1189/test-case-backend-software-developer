@@ -227,12 +227,12 @@ class Settings(BaseModel):
 # arbitrary key would reintroduce exactly the implicit-behaviour problem this module
 # exists to remove. Values are strings here and are coerced by the same validators the
 # file goes through, so `TRACKBOX_TARGET_FPS=abc` fails the same way the file would.
-_ENV_OVERRIDES: Mapping[str, tuple[str, ...]] = {
-    "TRACKBOX_VIDEO_PATH": ("video", "path"),
-    "TRACKBOX_TARGET_FPS": ("video", "target_fps"),
-    "TRACKBOX_API_URL": ("reporting", "api_url"),
-    "TRACKBOX_LOG_LEVEL": ("logging", "level"),
-    "TRACKBOX_LOG_FORMAT": ("logging", "format"),
+_ENV_OVERRIDES: Mapping[str, str] = {
+    "TRACKBOX_VIDEO_PATH": "video.path",
+    "TRACKBOX_TARGET_FPS": "video.target_fps",
+    "TRACKBOX_API_URL": "reporting.api_url",
+    "TRACKBOX_LOG_LEVEL": "logging.level",
+    "TRACKBOX_LOG_FORMAT": "logging.format",
 }
 
 
@@ -261,26 +261,39 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     return parsed
 
 
-def _apply_env_overrides(raw: dict[str, Any], environ: Mapping[str, str]) -> dict[str, Any]:
-    """Return a copy of ``raw`` with allowlisted environment overrides applied."""
+def _apply_overrides(raw: dict[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``raw`` with dotted-path overrides applied.
+
+    Both environment variables and command-line flags funnel through here, so an
+    override cannot take a route that skips validation. A dotted path that names a
+    section which does not exist yet (``a.b`` when ``a`` is absent) creates it, and the
+    resulting structure is then validated like any other -- an override that introduces
+    an unknown key still fails.
+    """
     merged = copy.deepcopy(raw)
 
-    for variable, key_path in _ENV_OVERRIDES.items():
-        value = environ.get(variable)
-        if value is None or value.strip() == "":
-            # An unset or blank variable means "no override", never "use empty value".
-            continue
-
+    for dotted_key, value in overrides.items():
+        *parents, leaf = dotted_key.split(".")
         cursor = merged
-        for key in key_path[:-1]:
+        for key in parents:
             section = cursor.get(key)
             if not isinstance(section, dict):
                 section = {}
                 cursor[key] = section
             cursor = section
-        cursor[key_path[-1]] = value
+        cursor[leaf] = value
 
     return merged
+
+
+def _env_overrides(environ: Mapping[str, str]) -> dict[str, Any]:
+    """Collect the allowlisted environment overrides that are actually set."""
+    return {
+        dotted_key: environ[variable]
+        for variable, dotted_key in _ENV_OVERRIDES.items()
+        # An unset or blank variable means "no override", never "use an empty value".
+        if environ.get(variable, "").strip()
+    }
 
 
 def _format_validation_error(exc: ValidationError, source: str) -> str:
@@ -296,13 +309,19 @@ def load_settings(
     path: str | Path,
     *,
     environ: Mapping[str, str] | None = None,
+    overrides: Mapping[str, Any] | None = None,
 ) -> Settings:
     """Load, override, and validate configuration for a run.
+
+    Precedence, lowest to highest: the configuration file, environment variables,
+    explicit ``overrides`` (command-line flags). Every layer is validated by the same
+    models, so no layer can introduce a value the file would have been rejected for.
 
     Args:
         path: Path to the YAML configuration file.
         environ: Environment to read overrides from. Defaults to ``os.environ``;
             injectable so tests do not have to mutate process state.
+        overrides: Additional dotted-path overrides, e.g. ``{"video.path": "x.mp4"}``.
 
     Returns:
         A fully validated, immutable :class:`Settings`.
@@ -313,7 +332,9 @@ def load_settings(
     """
     config_path = Path(path)
     raw = _read_config_file(config_path)
-    raw = _apply_env_overrides(raw, os.environ if environ is None else environ)
+    raw = _apply_overrides(raw, _env_overrides(os.environ if environ is None else environ))
+    if overrides:
+        raw = _apply_overrides(raw, overrides)
 
     try:
         return Settings.model_validate(raw)
