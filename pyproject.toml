@@ -13,7 +13,7 @@ requires-python = ">=3.11"
 # the pinned list the container and reviewers install from; this table exists so the
 # project is importable as a package and so tooling can resolve its imports.
 dependencies = [
-    "opencv-python>=4.10.0.84",
+    "opencv-python-headless>=4.10.0.84",
     "numpy>=2.0.0",
     "shapely>=2.0.6",
     "pydantic>=2.9.0",

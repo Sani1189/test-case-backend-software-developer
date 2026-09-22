@@ -3,12 +3,42 @@ services:
     build: ./mock_api
     ports:
       - "5000:5000"
+    # Added here rather than in mock_api/ so the service source stays untouched. It
+    # lets the runner wait for a genuinely ready endpoint instead of racing startup.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://localhost:5000/api/v1/jobs/events',
+          timeout=2).status == 200 else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
 
-  # Add your own service here once you've built your solution, e.g.:
-  #
-  # runner:
-  #   build: .
-  #   depends_on:
-  #     - mock_api
-  #   environment:
-  #     - MOCK_API_URL=http://mock_api:5000
+  runner:
+    build: .
+    depends_on:
+      mock_api:
+        # Waiting for health, not just for the container to exist, so the first
+        # progress report is not dropped against a socket that is not listening yet.
+        condition: service_healthy
+    environment:
+      # Container-to-container DNS. No host port mapping is involved, which is how the
+      # assignment wants this reported -- over the network, not via a shared file.
+      - TRACKBOX_API_URL=http://mock_api:5000
+    volumes:
+      # The feed is generated tooling output and is gitignored, so it is mounted rather
+      # than baked into the image. Read-only: the pipeline must not modify its input.
+      # The directory is mounted rather than the single file, because mounting a path
+      # that does not exist creates a directory and turns a clear error into a baffling
+      # one.
+      - ./:/data:ro
+    command:
+      - --config
+      - config/default.yaml
+      - --video
+      - /data/synthetic_pitch_feed.mp4
+    # A batch job runs once. Retry policy belongs to the orchestrator, not the container.
+    restart: "no"

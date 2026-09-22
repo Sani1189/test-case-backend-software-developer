@@ -1,0 +1,39 @@
+# Keep the build context small and the image free of anything not needed to run.
+# Without this the whole repository -- including a multi-hundred-megabyte .venv --
+# would be uploaded to the daemon on every build.
+
+.git
+.gitignore
+.gitattributes
+.github
+
+# Local environment
+.venv
+venv
+env
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+
+# Tooling caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+build
+dist
+*.egg-info
+
+# Not needed to run the pipeline
+legacy
+tests
+docs
+.mock_api_data
+__MACOSX
+*.md
+
+# Generated locally; the feed is mounted at run time instead, so a stale copy is
+# never baked into an image. Also keeps each build reproducible.
+*.mp4
+*.avi
+*.mov
