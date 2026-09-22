@@ -43,7 +43,7 @@ flowchart TB
         CFG["config.py<br/>pydantic settings, fail-fast loader"]
         MOD["models.py<br/>Detection, Progress, JobEvent, RunResult"]
         ERR["errors.py<br/>Fatal vs Recoverable taxonomy"]
-        LOG["logging.py<br/>structured JSON to stdout"]
+        LOG["logging_setup.py<br/>structured JSON to stdout"]
         VID["video.py<br/>FrameScheduler"]
         PIPE["pipeline.py<br/>orchestration"]
         AGG["aggregation.py<br/>streaming, robust aggregation"]
@@ -86,7 +86,7 @@ detector behaviour.
 | `config.py` | Loading, parsing, validating, and reporting config errors | Any defaulting or coercion beyond declared validators |
 | `models.py` | The data shapes that cross boundaries (detections, progress, events, results) | Business logic |
 | `errors.py` | The exception hierarchy and its mapping to exit codes | Catching anything itself |
-| `logging.py` | Log record shape, run correlation id | Deciding what is fatal |
+| `logging_setup.py` | Log record shape, run correlation id | Deciding what is fatal |
 | `video.py` | Deciding *which* frames to decode and yielding them | Interpreting frame content |
 | `pipeline.py` | Sequencing, counters, policy (fatal vs. continue), final result | Concrete detection, concrete transport |
 | `aggregation.py` | Turning per-frame observations into a final robust summary | Reading video |
