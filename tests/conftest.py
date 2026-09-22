@@ -50,3 +50,37 @@ def write_config(tmp_path: Path):
         return path
 
     return _write
+
+
+@pytest.fixture(scope="session")
+def sample_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A short synthetic feed, generated once for the whole session.
+
+    Deliberately tiny: 180 frames at 30fps. The tests that use it care about scheduling
+    and plumbing, not about detection quality, and a smaller fixture keeps the suite
+    fast enough to actually run.
+    """
+    from tools.synthetic_generator import generate_synthetic_video
+
+    path = tmp_path_factory.mktemp("video") / "feed.mp4"
+    generate_synthetic_video(str(path), numFrames=180)
+    return path
+
+
+@pytest.fixture(scope="session")
+def uniform_video(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A feed with no green in it at all, for the found-nothing path."""
+
+    def _make(colour: tuple[int, int, int], name: str) -> Path:
+        import cv2
+        import numpy as np
+
+        path = tmp_path_factory.mktemp("uniform") / name
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (320, 240))
+        frame = np.full((240, 320, 3), colour, dtype=np.uint8)
+        for _ in range(60):
+            writer.write(frame)
+        writer.release()
+        return path
+
+    return _make((255, 255, 255), "white.mp4")
