@@ -8,3 +8,9 @@ venv/
 .pytest_cache/
 __MACOSX/
 .DS_Store
+
+# Packaging and tooling output (relevant now that pyproject.toml exists)
+build/
+dist/
+*.egg-info/
+.ruff_cache/

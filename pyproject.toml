@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trackbox-pitch"
+version = "0.1.0"
+description = "Automated pitch boundary and camera crop engine"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Runtime dependencies mirror requirements.txt exactly. requirements.txt stays as
+# the pinned list the container and reviewers install from; this table exists so the
+# project is importable as a package and so tooling can resolve its imports.
+dependencies = [
+    "opencv-python>=4.10.0.84",
+    "numpy>=2.0.0",
+    "shapely>=2.0.6",
+    "pydantic>=2.9.0",
+    "requests>=2.32.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+pitch-pipeline = "trackbox_pitch.cli:main"
+
+[tool.setuptools.packages.find]
+# src layout: the package is only importable once installed, which forces tests to
+# exercise the real package rather than accidentally picking up a stray directory.
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "src" makes the package importable without an editable install; "." exposes the
+# tools/ package so tests can generate a synthetic feed fixture.
+pythonpath = ["src", "."]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
