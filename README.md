@@ -1,78 +1,66 @@
-# Automated Pitch Boundary & Camera Crop Engine
+# Pitch Boundary & Camera Crop Engine
 
-A production pipeline that ingests match video, detects the playing-field boundary in
-each frame, aggregates a result, and reports progress and outcome to the platform over
-HTTP.
+This reads a match video, finds the pitch boundary in each frame, works out a result,
+and tells the platform how the run went.
 
-It replaces the v0.1 research prototype, which is kept unmodified in `legacy/` for
-reference. What changed and why is in [`DECISIONS.md`](DECISIONS.md); the design
-reasoning is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+It replaces the old research prototype. That prototype is still in `legacy/`, untouched,
+so you can compare. See `DECISIONS.md` for why things are the way they are.
 
----
+## What you need
 
-## Requirements
+- Python 3.11 or newer (the container uses 3.12)
+- Docker if you want to run it the way it would run in production
+- A video. There is a script that makes a fake one for testing.
 
-- Python 3.11+ (the container uses 3.12)
-- Docker, for the containerised path
-- A video feed. The synthetic one is produced by `tools/synthetic_generator.py`
-
----
-
-## Quick start
+## Running it locally
 
 ```bash
 python -m venv .venv
-.venv/Scripts/activate          # Windows;  source .venv/bin/activate on POSIX
+.venv/Scripts/activate          # on Windows. On Mac or Linux use: source .venv/bin/activate
 pip install -r requirements.txt
 
-# The feed is generated tooling output and is gitignored, so make one first.
+# Make a fake video first. Videos aren't committed to git.
 python -c "from tools.synthetic_generator import generate_synthetic_video; generate_synthetic_video()"
 
-# Run with reporting switched off, for a local run with no platform listening.
+# Run it. --no-reporting means don't try to talk to the platform.
 python -m trackbox_pitch.cli --no-reporting --log-format console
 ```
 
-Machine-readable output is the default, because the consumer is an orchestrator rather
-than a person:
+Logs are JSON by default, because in production nobody is watching the screen. If you
+are a human reading them, add `--log-format console`.
 
-```bash
-python -m trackbox_pitch.cli --no-reporting | jq -c 'select(.event) | {event, level}'
-```
-
----
-
-## Running in Docker
-
-This is the deployment path. The pipeline runs in a container and reports to the
-reporting service over the network — no shared file, no database.
+## Running it in Docker
 
 ```bash
 python -c "from tools.synthetic_generator import generate_synthetic_video; generate_synthetic_video()"
 docker compose up --build
 ```
 
-`mock_api` starts first and the `runner` waits for it to report healthy. The feed is
-mounted read-only at `/data` rather than baked into the image.
+This starts the reporting service first and waits until it is actually ready, then runs
+the pipeline. The pipeline talks to it over the network. No shared files, no database.
 
-Inspect what the platform received:
+To see what the platform received:
 
 ```bash
 curl -s http://localhost:5000/api/v1/jobs/events | jq
 ```
 
----
+The video is mounted into the container instead of being copied into the image, so
+generated files never end up baked into an image.
 
-## Configuration
+## Settings
 
-`config/default.yaml` is the single source of truth. **Every field is required** — there
-are no built-in defaults to fall back on. A missing, misspelled, or out-of-range value
-stops the run at startup with a message naming the key, rather than failing part-way
-through or silently running with a value nobody chose.
+`config/default.yaml` holds everything. Every field has to be there. There are no hidden
+defaults.
 
-Overrides are validated by exactly the same models as the file, so an override cannot
-set something the file would have been rejected for.
+If something is missing, misspelled, or out of range, the program stops immediately and
+tells you which key was wrong. It does not run halfway and then fall over, and it does
+not quietly use a value you did not choose.
 
-| Environment variable | Overrides |
+You can also override settings with environment variables. They go through the same
+checks as the file, so you cannot sneak in a bad value that way either.
+
+| Variable | Changes |
 |---|---|
 | `TRACKBOX_VIDEO_PATH` | `video.path` |
 | `TRACKBOX_TARGET_FPS` | `video.target_fps` |
@@ -80,87 +68,74 @@ set something the file would have been rejected for.
 | `TRACKBOX_LOG_LEVEL` | `logging.level` |
 | `TRACKBOX_LOG_FORMAT` | `logging.format` |
 
-Precedence: file, then environment, then command-line flags.
+The file wins over nothing, then environment variables, then command line flags.
 
 ```bash
 python -m trackbox_pitch.cli --help
 ```
 
----
-
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Completed successfully |
-| 1 | Unexpected internal error |
-| 2 | Configuration error |
-| 3 | Input error (missing, unreadable, or empty video) |
-| 4 | Stream error (truncated or undecodable feed) |
-| 5 | Completed, but no valid boundary was found |
+| 0 | Finished fine |
+| 1 | Something unexpected broke. A bug. |
+| 2 | The config is wrong |
+| 3 | The video is missing, unreadable, or empty |
+| 4 | The video is cut short or a frame would not decode |
+| 5 | Ran fine, but found no pitch boundary anywhere |
 
-Deliberately distinct so an orchestrator can tell "bad config" from "bad video" from
-"ran fine but saw no pitch" without parsing log text.
+They are all different on purpose. A scheduler should be able to tell "bad config" from
+"bad video" from "ran fine but saw nothing" without reading any log text.
 
----
+## What it does
 
-## What it does and does not do
+- Keeps the finding of boundaries separate from the running of things. The pipeline asks
+  for a `FieldDetector` and does not know which one it gets. Detectors are picked by name
+  from the config, so a typo in a detector name fails at startup.
+- Only looks at frames it needs. A 1800 frame video gets looked at 300 times, not 1800.
+  Frames it skips are never decoded, just stepped over.
+- Does not keep anything that grows with the video length. Polygons are kept in a small
+  ring buffer.
+- Splits failures into "stop now" and "keep going", and counts every rejected frame with
+  the reason. Nothing gets dropped without being counted.
+- Sends reports built from proper models, and treats an unreachable platform as a
+  degradation, not a failure. But it never lets that hide a real failure.
 
-**Does**
+## What it does not do
 
-- Splits detection from orchestration: the pipeline imports a `FieldDetector`, never a
-  concrete one. Detectors are resolved by name from configuration, so an unknown
-  detector is a startup failure.
-- Scales work with what needs inspecting, not with file length. Skipped frames are
-  demand-ed minimally and never decoded; a 1800-frame feed is analysed in 300 samples.
-- Keeps nothing that grows with feed length. Polygons are bounded by a ring buffer.
-- Distinguishes fatal from recoverable failures, and counts every rejection with a
-  reason instead of dropping it silently.
-- Reports to the platform from validated models, and treats an unreachable platform as
-  a degradation rather than a failure — while never letting that mask a real failure.
+- No crop layout recommendation. The old prototype had a config block for it but never
+  read it. I left that block out instead of copying decoration.
+- The detector is not tuned. `green_threshold` is a straight port, known limitations and
+  all. See `DECISIONS.md`.
+- If the video resolution changes halfway through, it stops. Mixing up two coordinate
+  systems would quietly ruin every number, so stopping is better.
 
-**Does not**
-
-- Implement crop-layout recommendation. The prototype declared a `crop_search` config
-  block for it but never read it; that block is deliberately absent here rather than
-  carried forward as decoration. See `DECISIONS.md`.
-- Calibrate the detector. `green_threshold` is a faithful port, including its known
-  limitation.
-- Handle a mid-stream resolution change. It stops the run instead, because mixing
-  coordinate spaces would silently invalidate every metric.
-
----
-
-## Testing
+## Tests
 
 ```bash
 python -m pytest -q
 python -m ruff check src/ tests/
 ```
 
-Stream failure paths use a fake capture rather than a hand-broken video file, so they
-test the logic rather than the codec.
-
----
-
-## Layout
+## Where things live
 
 ```
 src/trackbox_pitch/
-  config.py         validated configuration, fail-fast loader
-  errors.py         failure taxonomy and exit codes
-  models.py         shapes crossing a boundary, internal and wire
-  detectors/        the one seam: a detector protocol plus implementations
-  video.py          frame scheduling: which frames are worth decoding
-  aggregation.py    robust, bounded aggregation of detections
-  logging_setup.py  one JSON object per line
-  reporting.py      platform reporting, retries, circuit breaker
-  pipeline.py       orchestration and failure policy
-  cli.py            thin entry point
-tools/              feed generator (fixture code, not shipped)
-legacy/             the original prototype, unmodified
+  config.py         settings, and the checks that reject bad ones
+  errors.py         what can go wrong, and what exit code it means
+  models.py         the shapes that get passed around and sent to the platform
+  detectors/        the one part that swaps out: finding the boundary
+  video.py          deciding which frames to look at
+  aggregation.py    adding up the results
+  logging_setup.py  one JSON line per event
+  reporting.py      talking to the platform
+  pipeline.py       runs the whole job
+  cli.py            the command line entry point
+tools/              makes the fake video. Not part of the shipped code.
+legacy/             the old prototype, untouched
 config/             default.yaml
-tests/              the suite
-docs/               architecture notes
-mock_api/           provided reporting service (untouched)
+tests/              the tests
+docs/               design notes
+mock_api/           the reporting service we were given. Not modified.
 ```

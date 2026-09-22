@@ -1,307 +1,322 @@
 # Decisions
 
-Where I stopped, what I assumed, and what I would ask before this went near production.
+Where I stopped, what I assumed, and what I would ask before this went anywhere near
+production.
 
-Design reasoning lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). This document
-is about the trade-offs: what I chose, what it cost, and what I deliberately did not do.
-
-Every performance number below was measured on this machine against the shipped
-1800-frame fixture, not estimated.
+The numbers below were all measured on this machine against the 1800 frame test video.
+None of them are estimates.
 
 ---
 
 ## 1. Assumptions and open questions
 
-### Assumed
+### Things I assumed
 
-- **The input is a local file.** The assignment says the feed generator is the input and
-  that my work starts from the feed it produces, so the pipeline consumes a path rather
-  than producing one. In production this is more likely an object-store key or a live
-  stream; `video.py` is the only module that would change, because everything downstream
-  sees an iterator of frames.
-- **Container metadata is approximately right.** Frame rate and frame count are read from
-  the container and trusted to within 2% (see §2).
-- **Resolution is constant within a feed.** A mid-stream change stops the run rather than
-  being absorbed, because every metric is in pixel space and mixing coordinate spaces
-  would silently invalidate all of them.
-- **The spatial metric is what the prototype meant by one.** The area of the detected
-  boundary intersected with the frame rectangle. I kept it, computed once, rather than
-  inventing a different metric.
-- **`confidence` is a proxy, not a score.** A colour-threshold detector has no calibrated
-  confidence, so it reports mask coverage. It is named and documented as a proxy instead
-  of being dressed up as a model probability.
+- **The video is a file on disk.** The brief says the generator makes the input and my
+  job starts from what it produces, so the pipeline takes a path. In production it is
+  probably a stream or an object store key. Only `video.py` would need to change, because
+  everything else just gets frames.
 
-### Would ask the product / ML team
+- **The frame rate and frame count from the file are roughly right.** I allow them to be
+  off by 2% (explained in section 2).
 
-1. **Is sampling acceptable?** Analysing at 5fps rather than 30fps is the single biggest
-   performance decision here, and it discards five frames in six. That is fine for an
-   aggregate. It would be wrong if anything downstream needs per-frame guarantees. This
-   is the question I would want answered before anything else.
-2. **What should "found nothing" mean to the orchestrator?** I chose exit 5 with a
-   `no_valid_detections` status. A whole match shot from a fixed camera with no pitch in
-   frame is a legitimate outcome, not a crash — but if the platform treats it as a data
-   gap that must be retried, that is a different code path.
-3. **Truncated feed: abort or salvage?** I abort (exit 4) with partial results attached.
-   The alternative is to process the prefix and mark the run degraded. That is a product
-   decision about whether partial data is better than none.
-4. **Who owns stream reconnection?** I treat a mid-stream decode failure as fatal. If
-   these are transient in production, the orchestrator should retry, and my exit code
-   tells it to. If the pipeline is expected to reconnect, that is new work.
-5. **Does anything actually consume the consensus boundary polygon?** If consumers only
-   want the aggregate metric, the ring buffer and the consensus selection can go and the
-   module gets simpler. I kept it because the prototype produced polygons and the README
-   describes them feeding a crop step.
-6. **Is crop layout in scope?** The prototype declares a `crop_search` config block and
-   never reads it, and its README says crop layout is "not yet implemented". I did not
-   implement it (see §2). If it is in scope, it belongs behind the same kind of seam.
-7. **Multi-camera.** The prototype README describes ingesting multi-camera video. I built
-   one feed per run and assume the orchestrator fans out. If a single run is meant to
-   handle several synchronised feeds, the scheduler and aggregator both change shape.
-8. **What false-positive rate is tolerable?** The detector is degenerate on this feed
-   (see §3), so I cannot give a real number. I would want a target before tuning.
+- **The resolution stays the same for the whole video.** If it changes, I stop the run.
+  Every measurement is in pixels. If half the video is at one size and half at another,
+  all the numbers become meaningless.
+
+- **The spatial metric is the one the prototype meant.** That is the area where the
+  boundary overlaps the frame. I kept it, but I compute it once now instead of rebuilding
+  the same rectangle on every frame.
+
+- **`confidence` is a rough stand-in, not a real score.** A colour threshold cannot give
+  you a real confidence. It reports how much of the frame matched the colour, and I
+  named and documented it that way instead of pretending it is something better.
+
+### Things I would ask the product and ML teams
+
+1. **Is it OK to look at 5 frames a second instead of 30?** This is the single biggest
+   performance decision in here, and it throws away five out of every six frames. That is
+   fine when the answer is a summary. It would be wrong if anything downstream needs every
+   single frame. I would want an answer to this before anything else.
+
+2. **What should "found nothing" mean to the scheduler?** I made it exit 5 with a
+   `no_valid_detections` status. A whole game shot from a fixed camera with no pitch in
+   view is a real outcome, not a crash. But if the platform treats it as missing data that
+   should be retried, that is a different piece of work.
+
+3. **If the video is cut short, should we stop or keep what we have?** I stop and exit 4,
+   with the partial results attached. The other option is to finish processing what is
+   there and mark the run as degraded. That is a product call about whether half a result
+   is better than none.
+
+4. **Who reconnects if the stream drops?** I treat a broken frame as fatal. If that is
+   usually a blip in production, the scheduler should retry and my exit code tells it so.
+   If the pipeline is supposed to reconnect itself, that is new work.
+
+5. **Does anything actually use the polygon?** If consumers only want the summary numbers,
+   the ring buffer and the consensus polygon can go and the code gets simpler. I kept them
+   because the prototype produced polygons and its README says they feed a crop step.
+
+6. **Is crop layout in scope?** The prototype has a `crop_search` config block that
+   nothing reads, and its README says crop layout is "not yet implemented". I did not build
+   it. If it is needed, it should sit behind the same kind of seam as the detector.
+
+7. **Multi-camera.** The prototype README talks about multi-camera video. I built one
+   video per run and assumed the scheduler fans out. If one run is meant to handle several
+   cameras at once, both the frame reader and the aggregator change.
+
+8. **How wrong is acceptable?** The detector is broken in a specific way on this feed
+   (section 2), so I cannot give you a real false positive rate. I would want a target
+   before tuning anything.
 
 ---
 
-## 2. Validation strictness versus fallback
+## 2. Where I fail fast, and where I allow a fallback
 
-### Where I fail fast
+### Where it stops
 
-| Situation | Behaviour | Exit |
+| What happened | What it does | Exit code |
 |---|---|---|
-| Configuration missing, unparsable, unknown key, out of range | Stop **before any I/O** | 2 |
-| Input absent, unopenable, or reports no frames | Stop | 3 |
-| Stream truncated, undecodable, or resolution changed | Stop | 4 |
-| Any unclassified exception | Stop, with traceback | 1 |
+| Config missing, unreadable, unknown key, bad value | Stops **before opening anything** | 2 |
+| Video missing, unopenable, or has no frames | Stops | 3 |
+| Video cut short, frame won't decode, resolution changes | Stops | 4 |
+| Anything unexpected | Stops, with the traceback | 1 |
 
-Configuration is validated before the video is opened, so a misconfigured run costs
-nothing. `extra="forbid"` on every model means a typo is an error: `min_are` instead of
-`min_area` reports both the offending key and the one that is now missing.
+Config is checked before the video is opened, so a bad config costs you nothing.
 
-**The cost of that strictness:** adding a field to the configuration is a breaking change
-for older config files. I accepted that. The alternative is a typo'd key being ignored
-while the pipeline runs with a value nobody chose, which is the exact failure the
-prototype already had — its `sport` fell back to `"soccer"` while the file said
-`"football"`, and its `min_area` fell back to `500` while the file said `1000`. Nobody
-would have noticed, because nothing failed.
+Every model rejects unknown keys. That means `min_are` instead of `min_area` is an error,
+and the message tells you both that `min_are` is not allowed and that `min_area` is
+missing.
 
-### The three deliberate fallbacks
+**What that costs:** adding a new setting breaks older config files. I took that trade
+deliberately. The alternative is a typo being ignored while the program runs with a value
+nobody picked. That is exactly what the prototype did. Its `sport` fell back to
+`"soccer"` while the file said `"football"`, and `min_area` fell back to `500` while the
+file said `1000`. Nobody would have noticed, because nothing failed.
 
-Each is a fallback in *behaviour*, and each is visible. None of them fabricates data.
+### The three places I do fall back
 
-1. **Unknown frame rate → analyse every frame.** If the container reports no usable fps, a
-   stride cannot be derived. Falling back to stride 1 costs more time but never discards
-   data, which is the safe direction. Logged at `WARNING` with the reason, so an operator
-   can tell why a run is slower than the configuration implies.
-2. **Truncation tolerance of 2%.** Container frame counts are approximate, so a stream
-   that ends a frame or two short is a clean end-of-file, not a corrupt feed. Beyond that
-   it is a `StreamError`. Without a tolerance every run would fail; with too generous a
-   one a genuinely truncated feed would be reported as complete, which is the bug being
-   fixed.
-3. **An unreachable platform degrades the run, it does not fail it.** Reports are retried
-   with backoff, then dropped, with a circuit breaker so a dead endpoint cannot make a
-   long run progressively slower. The run completes, and the result carries
-   `reporting_degraded` plus a dropped count. A failure to report is never allowed to
-   become the failure being reported.
+All three are visible, and none of them invent data.
 
-### What I removed rather than carried forward
+1. **No frame rate in the file, so look at every frame.** If the file does not say how
+   fast it is, I cannot work out a stride. Falling back to "look at everything" costs more
+   time but never throws data away. That is the safe direction. It logs a warning with the
+   reason, so if a run is slower than you expected you can find out why.
 
-Three pieces of the prototype's configuration are **not** carried over, because dead
-configuration is worse than no configuration — it tells an operator that turning a dial
-does something when it does not:
+2. **Cut short by up to 2% is fine.** Video files often report a frame count that is a
+   little off, so finishing two frames early is normal. More than that and it is a broken
+   file. Without a tolerance every run would fail. With too much tolerance, a genuinely
+   damaged video would be reported as a success, which is the bug I was fixing.
 
-| Prototype key | Status |
+3. **If the platform is down, the run still finishes.** Reports are retried with a
+   backoff and then dropped. A circuit breaker stops it hammering a dead service, which
+   would otherwise make a long run slower and slower. The run completes and the result
+   says `reporting_degraded` with a count of what was lost. A failure to report never
+   becomes the failure being reported.
+
+### Config I removed instead of copying
+
+Dead settings are worse than no settings. They tell an operator that turning a dial does
+something when it does nothing. These were all in the prototype and none of them were ever
+read:
+
+| Old setting | What happened to it |
 |---|---|
-| `field_detector.type: "sam_mask_v1"` | Never read. Now load-bearing: it selects the detector, and an unknown value fails at startup. |
-| `confidence_threshold: 0.5` | Assigned to `self.threshold` and never read. Became `aggregation.min_confidence`, which the aggregator actually enforces — a detection below it is counted as a `low_confidence` rejection. |
-| `debug_mode: True` | Never read. Became `logging.level` / `logging.format`, because a boolean cannot distinguish "quiet" from "diagnosable". |
-| `crop_search.*` | Entirely unused, and crop layout is not implemented. Omitted rather than included as decoration. |
-| `target_fps: 30` | Never read; every frame was decoded anyway. Now drives the sampling stride. |
+| `field_detector.type: "sam_mask_v1"` | Never read. Now it actually picks the detector, and an unknown name fails at startup. |
+| `confidence_threshold: 0.5` | Stored in a variable and never used. Became `aggregation.min_confidence`, which is really enforced: anything below it is counted as a `low_confidence` rejection. |
+| `debug_mode: True` | Never read. Became `logging.level` and `logging.format`, because a true/false cannot tell you the difference between quiet and diagnosable. |
+| `crop_search` (the whole block) | Unused, and crop layout is not built. Left out rather than copied as decoration. |
+| `target_fps: 30` | Never read, and every frame was decoded anyway. Now it drives the sampling. |
 
-### Where I did not "fix" the prototype
+### One thing I did not "fix", on purpose
 
-The detector is **kept faithful**, including a flaw, rather than quietly corrected.
-`DECISIONS` is the right place to say this rather than leaving a reviewer to discover it:
+I ported the detector as-is, including a real flaw. This is the part I would most want
+you to read.
 
-The synthetic background is solid green and the pitch is drawn as white lines *on top* of
-it. The detector thresholds for green, so in every non-blank frame **the green mask
-covers the whole frame**, and with `RETR_EXTERNAL` the largest contour is the **frame
-border, not the pitch**. Measured directly:
+The fake background is solid green and the pitch is drawn as white lines on top of it.
+The detector looks for green. So on every frame that is not blank, **the green mask covers
+the whole frame**, and the largest outline is therefore the **edge of the frame, not the
+pitch**. I measured it:
 
 ```
-blank frame      -> rejected (empty mask)
-green close-up   -> DETECTED, area 919,601  (the frame)
-noise rectangle  -> DETECTED, area 919,601  (the frame)
-normal frame     -> DETECTED, area 919,601  (the frame)
+blank frame     -> rejected
+green close-up  -> DETECTED, area 919,601  (the frame)
+noise frame     -> DETECTED, area 919,601  (the frame)
+normal frame    -> DETECTED, area 919,601  (the frame)
 ```
 
-All three non-blank cases produce an identical polygon. That is why the prototype's
-reported "1776 boundaries found" is not 1776 pitch boundaries — it is 1776 frames that
-contained green, and 98.7% is an artefact rather than a signal. It also shows up in the
-aggregate metric, whose **interquartile range across the whole run is exactly 0**.
+All three non-blank cases give back the same polygon. That is why the prototype's "1776
+boundaries found" is not 1776 pitch boundaries. It is 1776 frames that happened to contain
+green, and 98.7% is an artefact rather than a result. You can see it in the summary
+numbers too: across the whole run, the interquartile range of the metric is **exactly 0**.
 
-Fixing this is a modelling change, not a plumbing change, and doing it silently would
-hide the one thing a reviewer most needs to know about the detector. The test suite
-contains `test_known_limitation_the_boundary_is_the_frame_not_the_pitch`, which fails if
-the behaviour changes — so changing it has to be deliberate and documented rather than
-incidental.
+I could have quietly made the detector better. I did not, because fixing it is a modelling
+job rather than a plumbing one, and doing it silently would hide the most important thing
+about this detector.
+
+There is a test called
+`test_known_limitation_the_boundary_is_the_frame_not_the_pitch` that fails if this
+behaviour changes. So if someone improves the detector later, they have to do it on
+purpose and update the docs.
 
 ---
 
-## 3. Performance trade-offs
+## 3. Performance
 
-### Measured
+### The measurements
 
-| | Prototype | This pipeline |
+|  | Old prototype | This |
 |---|---|---|
-| Frames decoded | 1800 | 1800 (advanced with `grab()`) |
-| Frames analysed | 1800 | **300** |
-| Wall time | **47.6 s** | **2.5 s** |
-| Per frame | ~26 ms | — |
-| Metric IQR | — | **0** (see §2) |
+| Frames decoded | 1800 | 1800 (but stepped over with `grab()`) |
+| Frames actually looked at | 1800 | **300** |
+| Wall clock | **47.6 s** | **2.5 s** |
+| Per frame | about 26 ms | - |
+| Metric interquartile range | - | **0** (see section 2) |
 
-Roughly **19× faster** on the same feed, from the same detector, on the same machine.
+About **19 times faster** on the same video, same detector, same machine.
 
-### What the speedup is actually made of, and what it costs
+### Where that comes from, and what it costs
 
-**Sampling is the big win and the big risk.** Deriving a stride from the stream's real
-frame rate (30fps source, 5fps target → stride 6) means five frames in six are never
-looked at. For an aggregate result that is the right call. For anything needing per-frame
-output it is wrong. This is the first question in §1 for a reason: it is a product
-decision wearing a performance costume.
+**Sampling is the big win and the big risk.** I read the real frame rate from the file
+(30fps) and work out a stride from the target (5fps), which gives 6. So five frames out of
+six are never looked at. For a summary that is the right call. For anything needing
+per-frame output it is wrong. That is why it is question 1 above.
 
-**`grab()` instead of `read()`.** `read()` is `grab()` + `retrieve()`, and `retrieve()` is
-the expensive decode-to-BGR. Skipped frames are advanced with `grab()`, so they are
-demuxed but never decoded. Honest limitation: on inter-frame codecs you cannot truly jump
-past a frame without demuxing it, and `CAP_PROP_POS_FRAMES` seeking is not reliably
-frame-accurate across containers, so seeking was not used. This is a real reduction in
-work, not a free lunch.
+**`grab()` instead of `read()`.** `read()` is really two steps: grab the frame, then decode
+it. The decode is the expensive half. Skipped frames get the cheap half only. Honest
+caveat: on most codecs you still cannot jump past a frame without touching it, and seeking
+by frame number is not reliable across all video formats, so I did not use seeking. This
+is a real saving, not a free lunch.
 
-**Hoisting repeated work.** The prototype rebuilt a hardcoded `1280x720` polygon *every
-frame* to compute the intersection, and rebuilt its HSV bound arrays every frame. Both are
-built once now, from the stream's real dimensions — which also fixes correctness, not just
-speed: the prototype would have computed the wrong metric on any feed that was not
-720p.
+**Doing repeated work once.** The prototype rebuilt the same 1280x720 rectangle every
+single frame to calculate the overlap, and rebuilt its colour range arrays every frame
+too. Both are built once now, using the video's actual size. That also fixes a bug: on any
+video that was not 720p, the old code would have measured the wrong thing.
 
-**One area pass instead of two.** `max(contours, key=cv2.contourArea)` evaluates every
-contour's area and then evaluates the winner's again. Replaced with a single pass that
-keeps the winner.
+**One pass instead of two.** `max(contours, key=cv2.contourArea)` works out the area of
+every outline and then works out the winner's again. Now it is one pass that keeps the
+best one.
 
-**Cheap rejects before expensive work.** The minimum-area gate now runs *before* any
-Shapely construction, so the noise frames the generator deliberately injects — which
-otherwise become full-frame polygons — are rejected for the cost of a contour area.
+**Cheap rejections first.** The minimum size check now happens before any geometry work.
+The deliberately noisy frames in the test video used to become full-size polygons. Now
+they are thrown out for the cost of one area calculation.
 
-**Memory bounded in the dimension that matters.** The prototype appended
-`(frame, polygon, area)` for every frame: memory grew with feed length, so a genuinely
-long run would eventually die. Here the polygons — the heavy objects — are bounded by a
-ring buffer. Plain floats for the metric are retained so the median is exact; at 8 bytes
-per analysed frame that is about 1.4 MB for a ten-hour feed at 5fps, which is not worth
-approximating to save.
+**Memory is bounded where it matters.** The prototype added every polygon to a list for
+the whole run, so memory grew with the video length and a long enough run would eventually
+die. Here the polygons, which are the heavy things, are kept in a small ring buffer. The
+metric values are plain numbers and I keep all of them so the median is exact. At 8 bytes
+each that is about 1.4 MB for ten hours of video at 5fps, which is not worth throwing
+accuracy away to save.
 
-**Median and interquartile range, not mean.** The feed contains deliberate false
-positives. A mean lets them drag the headline number; a median does not. The cost is
-slightly less sensitivity to genuine gradual change across a run, which matters if the
-metric is expected to drift — worth revisiting if that is a real signal.
+**Median and interquartile range, not an average.** The video has fake detections built
+into it. An average lets those drag the headline number around. A median does not. The
+cost is that it is less sensitive to a genuine slow change during a run. If that turns out
+to be a real signal, it is worth revisiting.
 
-**Convergence early-exit is opt-in and off by default.** It is the only mechanism that
-makes a *longer* feed genuinely cheaper for the *same* analysis, so it is worth having.
-But it stops looking before the end, so it must be an explicit choice rather than the
-default. `aggregation.early_exit: false` in the shipped config.
+**Early exit is off by default.** It is the only thing here that makes a *longer* video
+genuinely cheaper for the *same* work, so it is worth having. But it stops looking before
+the end, so it should be a choice, not the default.
 
-### What I left on the table
+### What I did not get to
 
-- **`requirements.txt` uses open-ended pins** (`opencv-python-headless>=4.10.0.84`), which
-  resolved to OpenCV **5.0.0** on this machine. The generator and video I/O are verified
-  working there, but a submission that resolves dependencies differently next month is not
-  reproducible. I would pin exact versions with a constraints file. I stopped short of
-  doing it only because there is no CI here to keep pins honest.
-- **No benchmarking harness.** The 19× number is a single wall-clock measurement, not a
-  repeatable benchmark. A proper one would separate decode time from detection time from
-  aggregation time, and would use a longer feed to show the scaling curve rather than one
-  data point.
-- **No profiling.** I did not use a profiler; the optimisations are the ones visible from
-  reading the prototype, not the ones a profile would have found.
+- **Dependencies are not pinned to exact versions.** `requirements.txt` says things like
+  `opencv-python-headless>=4.10.0.84`, and on this machine that resolved to OpenCV
+  **5.0.0**. I checked the generator and video reading work on it, but a submission that
+  installs something different next month is not reproducible. I would pin exact versions
+  with a lock file. I did not do it here because there is no CI to keep pins honest.
+
+- **No proper benchmark.** The 19x is one wall clock measurement, not a curve. A real
+  benchmark would time decoding, detection, and adding up separately, and would use a much
+  longer video to show how it scales.
+
+- **No profiler.** I found these wins by reading the prototype, not by profiling it. A
+  profile would probably find different ones.
 
 ---
 
-## 4. AI / LLM disclosure
+## 4. How I used AI
 
-**Used: GitHub Copilot, in agent mode, throughout.** The design was directed by me; the
-code was largely written by the assistant from that direction.
+**I used GitHub Copilot in agent mode throughout.** I decided the design. The assistant
+wrote most of the code from that direction.
 
-**How it was used, concretely**
+### What it did
 
-- Reading the prototype and enumerating its defects against the four assignment parts.
-  The 12-row defect table at the top of `docs/ARCHITECTURE.md` came from that pass.
-- Writing the configuration models, the detector seam, the scheduler, the aggregator, the
+- Read the prototype and list its problems against the four parts of the brief. The table
+  at the top of `docs/ARCHITECTURE.md` came from that.
+- Wrote the config models, the detector seam, the frame scheduler, the aggregator, the
   reporter, the pipeline, and the CLI.
-- Writing the majority of the 176 tests, and the ad-hoc verification scripts used
-  throughout.
-- Drafting this document and the README from decisions I had already made and facts we
+- Wrote most of the 176 tests, and the small scripts I used to check things by hand.
+- Drafted this document and the README, from decisions I had already made and numbers we
   had already measured.
 
-**What I decided, and did not delegate**
+### What I decided myself
 
-- The scope call that matters most: **port the detector faithfully rather than fix it, and
-  document the flaw loudly.** Left to its own devices the assistant would have quietly
-  improved the detector, which would have hidden the most important finding in the
-  exercise.
-- Failing fast on unknown configuration keys rather than tolerating them, and accepting
-  the backward-compatibility cost that follows.
-- Not implementing crop layout, and removing its dead configuration block rather than
-  carrying it forward as decoration.
-- Commit granularity and the decision to push incrementally. The assignment grades history,
-  so an honest history had to be built as the work happened rather than reconstructed.
-- Every trade-off in §3.
+- **The big one: port the detector as-is instead of fixing it, and write down the flaw
+  loudly.** Left alone, the assistant would have quietly improved the detector. That would
+  have hidden the most useful finding in the whole exercise.
 
-**Where the assistant was wrong, and how it was caught**
+- Fail hard on unknown config keys, and accept that adding a setting later breaks old
+  configs.
 
-Its *claims* were much less reliable than its *code*, and the difference only showed up
-when things were run:
+- Not build crop layout, and delete its dead config block rather than keep it as
+  decoration.
 
-- Six tests failed on first run. Every one was a mistake in the test, not the code: the
-  scheduler opens the capture in `__enter__` rather than in the constructor; the fixture
-  frames were drawn at 720p coordinates on a 320×240 canvas so the pitch outline was
-  clipped into an open shape that split the green into separate regions; the progress
-  cadence was never reached because the fixture only yields 30 samples and the default
-  reports every 250. None of these were visible by reading the diff.
-- The truncation test returned exit 3 rather than 4, because truncating an MP4 removes its
-  `moov` atom and makes the file *unopenable* rather than *truncated*. The assistant's
-  expectation was wrong, not the code. The real `StreamError` path is now covered with a
-  fake capture instead.
-- Several edits were applied incorrectly during parallel edits to a single file, producing
-  syntactically broken Python that had to be repaired. Caught by running the parser, not by
-  reading.
-- A verification script compared the wrong paths and printed `DIFF` for files that were in
-  fact byte-identical. The check was wrong, not the code.
+- Commit granularity, and pushing as I went. The brief grades git history, so the history
+  had to be built while the work happened, not reconstructed at the end.
 
-The practical consequence: **no claim in this document rests on the assistant saying so.**
-The 19× speedup, the 0 interquartile range, the identical areas across frame types, and the
-exit codes were all measured after the fact. The assistant asserted the detector was
-degenerate from reading the source; that assertion was only believed once it had been
-demonstrated on real frames.
+- Every trade-off in section 3.
 
-**Not used:** nothing in the exercise was generated by an LLM and left unverified.
-Automated formatting and linting (`ruff`) are used, but those are tools, not generation.
+### Where the assistant was wrong
+
+Its **claims** were much less reliable than its **code**, and the difference only showed up
+when I actually ran things.
+
+- Six tests failed on the first run. All six were mistakes in the tests, not in the source
+  code. The scheduler opens the video when you enter the `with` block, not when you create
+  the object. The test frames were drawn at 720p coordinates on a 320x240 canvas, so the
+  pitch outline got clipped into an open shape and split the green into separate pieces.
+  The progress reporting test never fired because the test video only produces 30 frames
+  and the default setting reports every 250. None of these were visible by reading the
+  code.
+
+- My truncation test gave exit 3 instead of 4. Truncating an MP4 file removes its `moov`
+  atom, which makes the file impossible to open, which is exit 3. My expectation was
+  wrong, not the code. The real "video cut short" path is now tested with a fake video
+  reader instead.
+
+- Some edits were applied incorrectly when I sent several at once to the same file, which
+  produced Python that would not even parse. Found by running the parser, not by reading.
+
+- One of my check scripts compared the wrong file paths and reported "DIFF" for two files
+  that were actually byte for byte identical. The check was wrong, not the code.
+
+The point of all that: **nothing in this document rests on the assistant saying so.** The
+19x speedup, the zero interquartile range, the identical areas, and the exit codes were all
+measured after the fact. The assistant claimed the detector was broken just from reading
+the source. I only believed it once it was shown on real frames.
+
+**Not used:** nothing generated by an LLM was left unchecked. I do use `ruff` for
+formatting and linting, but that is a tool, not generation.
 
 ---
 
-## 5. Where I stopped, and what is next
+## 5. Where I stopped
 
-**Working, tested, and containerised:** configuration, the detector seam, sampling,
-aggregation, failure taxonomy, structured logging, platform reporting with degradation
-handling, the CLI, and the test suite.
+**Done, tested, and containerised:** config and its validation, the detector seam,
+sampling, aggregation, the failure rules, structured logging, platform reporting with
+degradation handling, the CLI, and the tests.
 
-**Deliberately not done**
+**Left out on purpose**
 
 | Not done | Why | Next step |
 |---|---|---|
-| Crop-layout recommendation | Not required by Parts 1–4; the prototype's config for it was dead. | Confirm scope; implement behind the same seam. |
-| Pinned dependency versions | No CI to keep pins honest. | Add a constraints file and a lock step. |
-| A real benchmark harness | One measurement, not a curve. | Time decode/detect/aggregate separately on a longer feed. |
-| A learned detector | The seam exists for it; the model does not. | Add a `sam_mask_v1` config variant plus a registry entry. The test asserting config and registry agree will enforce it. |
-| Auth on the reporting call | `mock_api` has none, and inventing one would be speculative. | Confirm the platform's auth scheme. |
-| Feed trimming to a time range | Not asked for; the prototype had no notion of it. | Would be a scheduler parameter, cheap to add. |
+| Crop layout recommendation | Not required by parts 1 to 4, and the prototype's config for it was dead | Confirm it is wanted, then build it behind the same seam |
+| Pinned dependency versions | No CI to keep pins honest | Add a lock file |
+| A real benchmark | One measurement, not a curve | Time decode, detect and aggregate separately on a longer video |
+| A real ML detector | The seam is there, the model is not | Add a `sam_mask_v1` config variant plus a registry entry. The test that checks config and registry agree will force it to be done properly |
+| Auth on the reporting call | `mock_api` has none, and inventing one would be guessing | Ask what the platform expects |
+| Processing only part of a video | Not asked for, and the prototype had no concept of it | A parameter on the frame scheduler. Cheap. |
 
-**The first thing I would do with more time:** answer question 1 in §1. If per-frame
-analysis turns out to be required, the largest performance decision in this design is
-wrong, and everything else is detail by comparison.
+**The first thing I would do with more time** is get an answer to question 1. If per-frame
+analysis turns out to be required, the biggest performance decision in here is wrong, and
+everything else is small by comparison.
