@@ -175,6 +175,16 @@ purpose and update the docs.
 
 About **19 times faster** on the same video, same detector, same machine.
 
+Inside the container, on the same video: **1.8 s**, 300 frames looked at, 298 good and 2
+rejected.
+
+One number worth knowing: with the reporting service deliberately unreachable, the same
+run took **75.9 s** instead of 1.8 s and still finished with exit code 0. That is the cost
+of retrying failed reports. The circuit breaker exists to stop that getting worse on a
+long run, but with only three reports in this run it never had the chance to open. A
+shorter timeout, or opening the breaker after the first couple of failures, would cut
+that down. It is a real weakness, not a hypothetical one.
+
 ### Where that comes from, and what it costs
 
 **Sampling is the big win and the big risk.** I read the real frame rate from the file
